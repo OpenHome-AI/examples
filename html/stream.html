@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Audio Stream</title>
+    <style>
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .status {
+            padding: 10px;
+            margin-bottom: 10px;
+            background-color: #f0f0f0;
+        }
+        .active { background-color: #90EE90; }
+        .error { background-color: #ffcccb; }
+        #retryButton {
+            padding: 10px;
+            margin: 10px 0;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="connectionStatus" class="status">Connection Status: Disconnected</div>
+        <div id="micStatus" class="status">Microphone Status: Off</div>
+        <div class="call-controls">
+            <button id="startCall" class="call-button">Start Call</button>
+            <button id="endCall" class="call-button">End Call</button>
+        </div>
+        <button id="retryButton" onclick="retryMicrophoneAccess()">Retry Microphone Access</button>
+        <audio id="audioPlayer" controls></audio>
+    </div>
+    <script>
+        const api_key = "0603b422363fe5f4cbed3af86431b8164bc8d047f2f5d981ecd641a0e8ed0e87"
+        const wsUrl = 'wss://app.openhome.xyz/websocket/voice-stream/' + api_key + '/0';
+        
+        const BUFFER_SIZE = 4096;
+        const FRAMES_PER_BUFFER = 3200;
+        const CHANNELS = 1;
+        const RATE = 16000;
+        
+        let ws;
+        let audioContext;
+        let mediaStream;
+        let reconnectAttempts = 0;
+        let microphoneSource;
+        let audioBuffer = new Float32Array();
+        
+        // Audio playback setup
+        let audioElement = document.getElementById('audioPlayer');
+        let mediaSource = null;
+        let sourceBuffer = null;
+        let audioQueue = [];
+        let isSourceOpen = false;
+
+        async function initAudio() {
+            try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('Your browser does not support audio recording');
+                }
+
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: RATE
+                });
+
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: CHANNELS,
+                        sampleRate: RATE,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                if (!mediaStream || !mediaStream.active) {
+                    throw new Error('Failed to get media stream');
+                }
+
+                const tracks = mediaStream.getAudioTracks();
+                if (!tracks || tracks.length === 0) {
+                    throw new Error('No audio tracks available');
+                }
+
+                microphoneSource = audioContext.createMediaStreamSource(mediaStream);
+                const processor = audioContext.createScriptProcessor(BUFFER_SIZE, CHANNELS, CHANNELS);
+
+                microphoneSource.connect(processor);
+                processor.connect(audioContext.destination);
+
+                processor.onaudioprocess = (e) => {
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    
+                    const newBuffer = new Float32Array(audioBuffer.length + inputData.length);
+                    newBuffer.set(audioBuffer);
+                    newBuffer.set(inputData, audioBuffer.length);
+                    audioBuffer = newBuffer;
+
+                    while (audioBuffer.length >= FRAMES_PER_BUFFER) {
+                        const samplesTo = audioBuffer.slice(0, FRAMES_PER_BUFFER);
+                        const pcmData = convertFloatTo16BitPCM(samplesTo);
+                        
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            const base64Audio = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+                            ws.send(JSON.stringify({
+                                type: 'audio',
+                                data: base64Audio
+                            }));
+                        }
+                        
+                        audioBuffer = audioBuffer.slice(FRAMES_PER_BUFFER);
+                    }
+                };
+
+                document.getElementById('micStatus').textContent = 'Microphone Status: Active';
+                document.getElementById('micStatus').classList.add('active');
+                document.getElementById('micStatus').classList.remove('error');
+                document.getElementById('retryButton').style.display = 'none';
+
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
+            } catch (error) {
+                console.error('Error initializing audio:', error);
+                document.getElementById('micStatus').textContent = 'Microphone Status: Error - ' + error.message;
+                document.getElementById('micStatus').classList.add('error');
+                document.getElementById('micStatus').classList.remove('active');
+                document.getElementById('retryButton').style.display = 'block';
+                throw error;
+            }
+        }
+
+        function convertFloatTo16BitPCM(float32Array) {
+            const int16Array = new Int16Array(float32Array.length);
+            for (let i = 0; i < float32Array.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32Array[i]));
+                int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return int16Array;
+        }
+
+        async function retryMicrophoneAccess() {
+            try {
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop());
+                }
+                
+                if (audioContext) {
+                    await audioContext.close();
+                }
+
+                audioBuffer = new Float32Array();
+                await initAudio();
+            } catch (error) {
+                console.error('Error retrying microphone access:', error);
+                document.getElementById('micStatus').textContent = 'Microphone Status: Error - ' + error.message;
+                document.getElementById('micStatus').classList.add('error');
+            }
+        }
+
+        function createMediaSource() {
+            return new Promise((resolve, reject) => {
+                try {
+                    if (!isCallActive) {
+                        reject(new Error('Call is not active'));
+                        return;
+                    }
+
+                    if (mediaSource) {
+                        if (mediaSource.readyState !== 'closed') {
+                            try {
+                                mediaSource.endOfStream();
+                            } catch (e) {
+                                console.error('Error ending previous media source:', e);
+                            }
+                        }
+                        mediaSource = null;
+                        sourceBuffer = null;
+                    }
+
+                    mediaSource = new MediaSource();
+                    audioElement.src = URL.createObjectURL(mediaSource);
+                    // Set up automatic play when data is available
+                    audioElement.addEventListener('canplay', () => {
+                        audioElement.play().catch(e => console.error('Error playing audio:', e));
+                    });
+
+                    // Handle audio ending
+                    audioElement.addEventListener('ended', () => {
+                        if (audioQueue.length > 0) {
+                            audioElement.play().catch(e => console.error('Error playing audio:', e));
+                        }
+                    });
+                    
+                    mediaSource.addEventListener('sourceopen', () => {
+                        try {
+                            console.log('MediaSource opened');
+                            isSourceOpen = true;
+                            
+                            if (!sourceBuffer && mediaSource.readyState === 'open') {
+                                sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+                                sourceBuffer.mode = 'sequence';
+                                sourceBuffer.addEventListener('updateend', () => {
+                                    if (audioQueue.length > 0 && !sourceBuffer.updating) {
+                                        processAudioQueue();
+                                    }
+                                });
+                            }
+                            
+                            resolve();
+                        } catch (e) {
+                            console.error('Error in sourceopen:', e);
+                            reject(e);
+                        }
+                    });
+
+                    mediaSource.addEventListener('sourceended', () => {
+                        console.log('MediaSource ended');
+                        isSourceOpen = false;
+                    });
+
+                    mediaSource.addEventListener('sourceclose', () => {
+                        console.log('MediaSource closed');
+                        isSourceOpen = false;
+                        if (isCallActive) {
+                            setTimeout(() => createMediaSource().catch(console.error), 1000);
+                        }
+                    });
+
+                } catch (e) {
+                    console.error('Error creating MediaSource:', e);
+                    reject(e);
+                }
+            });
+        }
+
+        function processAudioQueue() {
+            if (!sourceBuffer || !isSourceOpen) return;
+            
+            while (audioQueue.length > 0 && !sourceBuffer.updating) {
+                try {
+                    const data = audioQueue.shift();
+                    sourceBuffer.appendBuffer(data);
+                    return;
+                } catch (e) {
+                    console.error('Error appending buffer:', e);
+                    if (e.name === 'QuotaExceededError') {
+                        if (sourceBuffer.buffered.length > 0) {
+                            const start = sourceBuffer.buffered.start(0);
+                            const end = sourceBuffer.buffered.end(0);
+                            if (end - start > 10) {
+                                sourceBuffer.remove(start, end - 10);
+                            }
+                        }
+                        audioQueue.unshift(data);
+                        return;
+                    }
+                    createMediaSource().catch(console.error);
+                    return;
+                }
+            }
+        }
+
+        async function initWebSocket() {
+            try {
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = async () => {
+                    console.log('WebSocket connected');
+                    document.getElementById('connectionStatus').textContent = 'Connection Status: Connected';
+                    document.getElementById('connectionStatus').classList.add('active');
+                    document.getElementById('connectionStatus').classList.remove('error');
+                    reconnectAttempts = 0;
+                    
+                    await createMediaSource();
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const message = JSON.parse(event.data);
+                        if (message.type === 'audio' && message.data) {
+                            ws.send(JSON.stringify({
+                                type: "ack",
+                                data: "audio-received"
+                            }));
+
+                            const audioData = base64ToUint8Array(message.data);
+                            audioQueue.push(audioData);
+                            
+                            if (sourceBuffer && !sourceBuffer.updating) {
+                                processAudioQueue();
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error processing message:', error);
+                    }
+                };
+
+                ws.onclose = () => {
+                    console.log('WebSocket closed');
+                    document.getElementById('connectionStatus').textContent = 'Connection Status: Disconnected';
+                    document.getElementById('connectionStatus').classList.remove('active');
+                    document.getElementById('connectionStatus').classList.add('error');
+                    
+                    const timeout = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+                    reconnectAttempts++;
+                    setTimeout(() => {
+                        initWebSocket();
+                    }, timeout);
+                };
+
+                ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    document.getElementById('connectionStatus').textContent = 'Connection Status: Error';
+                    document.getElementById('connectionStatus').classList.remove('active');
+                    document.getElementById('connectionStatus').classList.add('error');
+                };
+            } catch (error) {
+                console.error('Error initializing WebSocket:', error);
+                document.getElementById('connectionStatus').textContent = 'Connection Status: Error - ' + error.message;
+                document.getElementById('connectionStatus').classList.add('error');
+            }
+        }
+
+        function base64ToUint8Array(base64) {
+            const binaryString = atob(base64);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes;
+        }
+
+        let isCallActive = false;
+        const startCallButton = document.getElementById('startCall');
+        const endCallButton = document.getElementById('endCall');
+
+        // Add event listeners for the buttons
+        startCallButton.addEventListener('click', startCall);
+        endCallButton.addEventListener('click', endCall);
+
+        async function startCall() {
+            if (isCallActive) return;
+            
+            try {
+                startCallButton.disabled = true;
+                // Reset all states before starting new call
+                await resetStates();
+                await init();
+                isCallActive = true;
+                startCallButton.style.display = 'none';
+                endCallButton.style.display = 'block';
+                audioElement.play().catch(e => console.error('Error playing audio:', e));
+            } catch (error) {
+                console.error('Error starting call:', error);
+                startCallButton.disabled = false;
+            }
+        }
+
+        async function endCall() {
+            if (!isCallActive) return;
+
+            try {
+                // Stop the microphone
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop());
+                    mediaStream = null;
+                }
+
+                // Close audio context
+                if (audioContext) {
+                    await audioContext.close();
+                    audioContext = null;
+                }
+
+                // Close WebSocket connection
+                if (ws) {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.close();
+                    }
+                    ws = null;
+                }
+
+                await resetStates();
+
+                // Update UI
+                startCallButton.style.display = 'block';
+                startCallButton.disabled = false;
+                endCallButton.style.display = 'none';
+                document.getElementById('connectionStatus').textContent = 'Connection Status: Disconnected';
+                document.getElementById('connectionStatus').classList.remove('active');
+                document.getElementById('micStatus').textContent = 'Microphone Status: Off';
+                document.getElementById('micStatus').classList.remove('active');
+
+            } catch (error) {
+                console.error('Error ending call:', error);
+            }
+        }
+        async function resetStates() {
+            // Reset MediaSource
+            if (mediaSource) {
+                if (mediaSource.readyState !== 'closed') {
+                    try {
+                        mediaSource.endOfStream();
+                    } catch (e) {
+                        console.error('Error ending media stream:', e);
+                    }
+                }
+                mediaSource = null;
+            }
+
+            // Clear source buffer
+            if (sourceBuffer) {
+                try {
+                    if (!sourceBuffer.updating) {
+                        sourceBuffer.abort();
+                    }
+                } catch (e) {
+                    console.error('Error aborting source buffer:', e);
+                }
+                sourceBuffer = null;
+            }
+
+            // Reset audio element
+            try {
+                audioElement.pause();
+                audioElement.src = '';
+                audioElement.load(); // Important: properly reset the audio element
+            } catch (e) {
+                console.error('Error resetting audio element:', e);
+            }
+
+            // Reset other states
+            audioQueue = [];
+            isSourceOpen = false;
+            audioBuffer = new Float32Array();
+            isCallActive = false;
+            reconnectAttempts = 0;
+
+            // Return a promise that resolves after a short delay
+            return new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        // Modify the init function to not auto-start
+        async function init() {
+            try {
+                await initWebSocket();
+                await initAudio();
+                
+                setInterval(() => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 30000);
+
+                document.addEventListener('click', async () => {
+                    if (audioContext && audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                });
+
+            } catch (error) {
+                console.error('Initialization error:', error);
+                throw error; // Propagate the error to handle it in startCall
+            }
+        }
+
+        //init().catch(console.error);
+    </script>
+</body>
+</html>
